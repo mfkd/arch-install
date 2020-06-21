@@ -1,0 +1,206 @@
+#!/bin/bash -e
+
+# curl -Lo setup https://bit.ly/1amkr3b
+
+set -x
+
+read -rp "Hostname: " hostname
+read -rp "Device: " device
+read -rp "Timezone: " timezone
+read -rp "Machine type (desktop/server): " machine_type
+read -rp "Encrypt (0/1): " encrypt
+read -rp "GPT (0/1): " gpt
+read -rp "Ansible (0/1): " ansible
+
+short_hostname=${hostname::5}
+extra=''
+
+if [[ $device == *nvme* ]]; then
+    # nvme devices look like /dev/nvme0n1 as the base device, then
+    # /dev/nvme0n1p1 as the partition
+    extra=p
+fi
+
+wipefs -a "$device"
+
+if (( gpt )); then
+    sgdisk -Z "$device"
+
+    sgdisk -n 0:0:+512M -t 1:ef00 -c 1:ESP "$device"
+    sgdisk -n 0:0:+2G -t 2:8200 -c 2:Swap "$device"
+    sgdisk -n 0:0:0 -c 3:Root "$device"
+else
+    fdisk "$device" << 'EOF'
+o
+n
+p
+1
+
++512M
+n
+p
+2
+
++2G
+t
+2
+82
+n
+p
+3
+
+
+a
+3
+w
+EOF
+fi
+
+
+partprobe "$device"
+
+# partprobe is async :(
+sleep 5
+
+boot_partition=${device}${extra}1
+swap_partition_raw=${device}${extra}2
+root_partition=${device}${extra}3
+
+# Can't use by-id because it doesn't exist for virtio devices
+# https://bugs.launchpad.net/ubuntu/+source/udev/+bug/635096
+swap_partition_path=$(find -L /dev/disk/by-path -samefile "$swap_partition_raw" | head -1)
+
+if ! [[ $swap_partition_path ]]; then
+    echo "Cannot get swap partition ID for $swap_partition_raw" >&2
+    exit 1
+fi
+
+mkfs.msdos -F32 -n "$short_hostname"-/boot "$boot_partition"
+
+mountpoint=$(mktemp -d)
+
+root_crypt_device=cryptroot
+root_crypt_device_path=/dev/mapper/$root_crypt_device
+
+if (( encrypt )); then
+    cryptsetup -y -v luksFormat "$root_partition"
+    cryptsetup luksOpen --allow-discards "$root_partition" "$root_crypt_device"
+    mkfs.btrfs -f -l 32K -n 32K -L "$short_hostname"-/ "$root_crypt_device_path"
+    mount -o noatime,compress-force=zstd "$root_crypt_device_path" "$mountpoint"
+else
+    mkfs.btrfs -f -l 32K -n 32K -L "$short_hostname"-/ "$root_partition"
+    mount -o noatime,compress-force=zstd "$root_partition" "$mountpoint"
+fi
+
+mkdir -p "$mountpoint"/boot
+mount "$boot_partition" "$mountpoint"/boot
+
+# Make sure we have at least some kind of a reliable mirror to start with
+echo 'Server = http://mirror.bytemark.co.uk/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist
+
+pacman -Syy
+pacman --noconfirm --ignore pacman -S tmux
+
+pacstrap "$mountpoint" base base-devel git ansible
+
+cat > /etc/pacman.d/mirrorlist << 'EOF'
+Server = http://mirror.bytemark.co.uk/archlinux/$repo/os/$arch
+EOF
+
+cp /etc/pacman.d/mirrorlist "$mountpoint"/etc/pacman.d/mirrorlist
+
+cat > "$mountpoint"/etc/fstab << EOF
+LABEL=$short_hostname-/boot /boot vfat  defaults,noatime 0 1
+LABEL=$short_hostname-/     /     btrfs defaults,noatime,compress-force=zstd 0 1
+EOF
+
+if (( encrypt )); then
+    cat > "$mountpoint"/etc/crypttab << EOF
+swap $swap_partition_path /dev/urandom swap,cipher=aes-cbc-essiv:sha256,size=256
+EOF
+
+    cat >> "$mountpoint"/etc/fstab << EOF
+/dev/mapper/swap            none  swap  defaults,noauto,x-systemd.device-timeout=10 0 0
+EOF
+else
+    mkswap -L "$short_hostname"-swap "$swap_partition_raw"
+    cat >> "$mountpoint"/etc/fstab << EOF
+LABEL=$short_hostname-swap none swap sw -1 0
+EOF
+fi
+
+echo "$hostname" > "$mountpoint"/etc/hostname
+
+arch-chroot "$mountpoint" ln -sf /usr/share/zoneinfo/"$timezone" /etc/localtime
+
+if (( ansible )); then
+    arch-chroot "$mountpoint" mkdir -p /root/git
+
+    case $machine_type in
+        desktop) arch-chroot "$mountpoint" git clone --recursive https://github.com/cdown/ansible-desktop.git /root/git/ansible ;;
+        server) arch-chroot "$mountpoint" git clone --recursive https://github.com/cdown/ansible-server.git /root/git/ansible ;;
+    esac
+
+    # systemd won't execute in a plain chroot, we need a namespaced container with
+    # its own systemd pid 1.
+    session_name=ansible
+    machine_name=ansible
+
+    extra_nspawn_args=()
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        extra_nspawn_args=(--bind /sys/firmware/efi/efivars)
+    fi
+
+    # CAP_SYS_RAWIO is needed for the FIBMAP ioctl, issued by syslinux
+    tmux new-session -d -s "$session_name" \
+        systemd-nspawn -b -M "$machine_name" -D "$mountpoint" \
+            --capability=CAP_SYS_ADMIN,CAP_SYS_RAWIO \
+            --bind /dev/mapper/control \
+            --bind "/lib/modules/$(uname -r)" \
+            --bind "$device" \
+            --bind "$boot_partition" \
+            --bind "$root_partition" \
+            "${extra_nspawn_args[@]}"
+    tmux new-window -t "$session_name" \
+        "sleep 10 && systemd-run -t --machine \"$machine_name\" /root/git/ansible/run && machinectl poweroff ansible && tmux kill-session -t ansible"
+    tmux select-window -t "$session_name:1"
+    tmux attach -t "$session_name"
+else
+    # This is a super minimal install for testing, just slap on syslinux
+    pacstrap "$mountpoint" syslinux
+    arch-chroot "$mountpoint" syslinux-install_update -i -a -m
+
+    if (( encrypt )); then
+        encrypted_root_uuid=$(cryptsetup luksUUID "$root_partition")
+        append="cryptdevice=UUID=$encrypted_root_uuid:$root_crypt_device:allow-discards root=$root_crypt_device_path rw"
+    else
+        append="root=LABEL=$short_hostname-/ rw"
+    fi
+
+    cat > "$mountpoint"/boot/syslinux/syslinux.cfg << EOF
+PROMPT 1
+TIMEOUT 5
+DEFAULT arch
+
+LABEL arch
+    LINUX ../vmlinuz-linux
+    APPEND $append
+    INITRD ../initramfs-linux.img
+
+LABEL archfallback
+    LINUX ../vmlinuz-linux
+    APPEND $append
+    INITRD ../initramfs-linux-fallback.img
+EOF
+
+fi
+
+echo "Root password:"
+while ! arch-chroot "$mountpoint" passwd; do :; done
+
+for user in cdown lin; do
+    if grep -q "^$user:" "$mountpoint"/etc/passwd; then
+        echo "$user password:"
+        while ! arch-chroot "$mountpoint" passwd "$user"; do :; done
+    fi
+done

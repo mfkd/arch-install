@@ -1,0 +1,30 @@
+#!/bin/bash -e
+
+# curl -Lo systemd-setup https://bit.ly/2AB3pyT
+
+set -x
+
+cat > /etc/sudoers << 'EOF'
+root  ALL=(ALL) ALL
+%sudo ALL=(ALL) ALL
+makepkg ALL=NOPASSWD: /usr/bin/pacman *
+EOF
+
+if ! getent passwd makepkg >/dev/null 2>&1; then
+    useradd -m makepkg
+    passwd makepkg
+fi
+
+pacman -S --assume-installed systemd --noconfirm --needed base base-devel git
+
+if [[ -d /home/makepkg/systemd-cdown-git ]]; then
+    (cd ~makepkg/systemd-cdown-git && sudo -u makepkg git fetch -p && sudo -u makepkg git reset --hard origin/master)
+else
+    (cd ~makepkg && sudo -u makepkg git clone http://aur.archlinux.org/systemd-cdown-git.git)
+fi
+
+sudo -iu makepkg rm -f ~makepkg/systemd-cdown-git/*.pkg.tar.xz
+sudo -iu makepkg sh -c 'cd ~/systemd-cdown-git && makepkg -s --nocheck'
+pacman -U ~makepkg/systemd-cdown-git/{systemd-cdown-libs-git,systemd-cdown-git,systemd-cdown-sysvcompat-git}-*.pkg.tar.xz
+
+systemctl daemon-reexec
